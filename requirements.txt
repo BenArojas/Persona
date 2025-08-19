@@ -1,0 +1,6 @@
+langchain
+langchain-ollama
+chromadb
+neo4j
+streamlit
+sentence-transformers

@@ -1,0 +1,29 @@
+# Python virtual environments
+venv/
+env/
+persona-env/
+
+# Python cache and build files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large data files (vector stores, models, etc.)
+personas/*/vectordb/
+*.db
+*.sqlite
+
+# Neo4j database files
+*.graphdb
+neo4j/
+
+# Temporary data
+data/*
+*.tmp
+*.log
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
