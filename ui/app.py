@@ -51,6 +51,12 @@ if 'selected_persona' not in st.session_state:
     st.session_state.selected_persona = None
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
+if 'form_reset' not in st.session_state:
+    st.session_state.form_reset = False
+if 'files' not in st.session_state:
+    st.session_state.files = None
+if 'url' not in st.session_state:
+    st.session_state.url = ""
 
 # Function to get list of personas from personas/ directory
 def get_personas():
@@ -64,7 +70,7 @@ def get_personas():
         return []
 
 # --- Backend Functions ---
-def create_new_persona_backend(name, source_type, files=None):
+def create_new_persona_backend(name, source_type, files=None, url=None):
     """Create a new persona folder and metadata file."""
     # Validate persona name
     if not name.strip():
@@ -78,6 +84,15 @@ def create_new_persona_backend(name, source_type, files=None):
     if safe_name in get_personas():
         st.error(f"Persona '{safe_name}' already exists.")
         return False
+    if source_type not in ["local", "web"]:
+        st.error("Please select exactly one data source (Upload Files or Fetch from Web).")
+        return False
+    if source_type == "local" and not files:
+        st.error("Please upload at least one file.")
+        return False
+    if source_type == "web" and (not url or not url.strip()):
+        st.error("Please provide a valid URL.")
+        return False
 
     try:
         # Create persona folder and vectordb subfolder
@@ -85,19 +100,25 @@ def create_new_persona_backend(name, source_type, files=None):
         vector_dir = os.path.join(persona_dir, CHROMA_DIR)
         os.makedirs(vector_dir, exist_ok=True)
 
-        # Create metadata file
+        # Prepare metadata
         metadata = {
             "name": name,
             "source_type": source_type,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "file_count": len(files) if files else 0
+            "sources": []
         }
+        if source_type == "local" and files:
+            metadata["sources"] = [{"type": "file", "name": file.name} for file in files]
+        elif source_type == "web" and url:
+            metadata["sources"] = [{"type": "url", "value": url}]
+
+        # Create metadata file
         with open(os.path.join(persona_dir, "info.json"), "w") as f:
             json.dump(metadata, f, indent=4)
 
         st.toast(f"Creating persona '{name}'...")
         with st.spinner(f"Setting up persona '{name}'..."):
-            time.sleep(1)  # Brief delay for UX
+            time.sleep(1)  # Brief delay for UX, replace with pipeline processing later
         st.success(f"Persona '{name}' created successfully!")
         return True
     except Exception as e:
@@ -118,17 +139,52 @@ def show_main_page():
     st.info("Create a new persona below, or select an existing one from the sidebar to begin chatting.")
 
     st.header("Create a New Persona")
+
+    # Initialize checkbox states if form was reset
+    if st.session_state.form_reset:
+        upload_files = False
+        fetch_web = False
+    else:
+        upload_files = st.session_state.get('upload_files', False)
+        fetch_web = st.session_state.get('fetch_web', False)
+
+    # Handle checkbox logic to ensure only one is selected
+    def update_upload_files():
+        st.session_state.upload_files = True
+        st.session_state.fetch_web = False
+        st.session_state.url = ""
+        st.session_state.files = None
+
+    def update_fetch_web():
+        st.session_state.upload_files = False
+        st.session_state.fetch_web = True
+        st.session_state.files = None
+        st.session_state.url = ""
+
+    st.checkbox("Upload Files", value=upload_files, key="upload_files", on_change=update_upload_files)
+    st.checkbox("Fetch from Web", value=fetch_web, key="fetch_web", on_change=update_fetch_web)
+
+    # Show inputs based on checkbox state
+    if st.session_state.upload_files:
+        st.session_state.files = st.file_uploader("Upload documents (.pdf, .txt)", accept_multiple_files=True)
+    elif st.session_state.fetch_web:
+        st.session_state.url = st.text_input("Website URL", value=st.session_state.url, placeholder="e.g., https://www.gutenberg.org/ebooks/3600")
+    else:
+        st.session_state.files = None
+        st.session_state.url = ""
+        st.warning("Please select a data source.")
+
+    # Form for submission
     with st.form(key="persona_form"):
         name = st.text_input("Persona Name", placeholder="e.g., My Mom, Albert Einstein")
-        source_type = st.radio("Select Data Source", ('Upload Files', 'Fetch from Web'))
-        
-        files = None
-        if source_type == 'Upload Files':
-            files = st.file_uploader("Upload documents (.pdf, .txt)", accept_multiple_files=True)
-
         submitted = st.form_submit_button("Create Persona")
         if submitted:
-            if create_new_persona_backend(name, source_type, files):
+            source_type = "local" if st.session_state.upload_files else "web" if st.session_state.fetch_web else None
+            if create_new_persona_backend(name, source_type, files=st.session_state.files, url=st.session_state.url):
+                # Signal form reset for next run
+                st.session_state.form_reset = True
+                st.session_state.files = None
+                st.session_state.url = ""
                 st.rerun()
 
 def show_chat_screen():
