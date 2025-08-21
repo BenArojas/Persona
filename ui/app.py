@@ -1,3 +1,17 @@
+import logging
+import traceback
+
+logging.basicConfig(
+    level=logging.DEBUG,  # Set to DEBUG for more detailed output
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Output to console
+        logging.FileHandler('app.log', mode='w')  # Output to a file
+    ]
+)
+logger = logging.getLogger(__name__)
+
+import shutil
 import streamlit as st
 import time
 import os
@@ -9,6 +23,8 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from config.config import PERSONAS_DIR, CHROMA_DIR
+from src.ingestion_local import process_local_files
+
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -51,198 +67,208 @@ if 'selected_persona' not in st.session_state:
     st.session_state.selected_persona = None
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
-if 'form_reset' not in st.session_state:
-    st.session_state.form_reset = False
-if 'files' not in st.session_state:
-    st.session_state.files = None
-if 'url' not in st.session_state:
-    st.session_state.url = ""
 
-# Function to get list of personas from personas/ directory
+# --- Helper Functions ---
 def get_personas():
     try:
-        # List directories in PERSONAS_DIR, excluding non-folders
         personas = [name for name in os.listdir(PERSONAS_DIR) 
                     if os.path.isdir(os.path.join(PERSONAS_DIR, name))]
-        return sorted(personas)  # Sort for consistent display
+        return sorted(personas)
     except FileNotFoundError:
         os.makedirs(PERSONAS_DIR, exist_ok=True)
         return []
 
 # --- Backend Functions ---
 def create_new_persona_backend(name, source_type, files=None, url=None):
-    """Create a new persona folder and metadata file."""
-    # Validate persona name
+    """
+    Creates a new persona with improved error handling and cleanup.
+    """
+    logger.debug(f"Starting create_new_persona_backend: name='{name}', source_type='{source_type}', files={files}, url={url}")
+    
     if not name.strip():
         st.error("Persona name cannot be empty.")
+        logger.error("Persona name is empty")
         return False
-    # Sanitize name to avoid invalid characters in folder names
+    
     safe_name = "".join(c for c in name if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
+    logger.debug(f"Safe name generated: {safe_name}")
     if not safe_name:
         st.error("Persona name contains invalid characters.")
+        logger.error("Invalid persona name after sanitization")
         return False
+    
     if safe_name in get_personas():
         st.error(f"Persona '{safe_name}' already exists.")
+        logger.error(f"Persona '{safe_name}' already exists")
         return False
-    if source_type not in ["local", "web"]:
-        st.error("Please select exactly one data source (Upload Files or Fetch from Web).")
-        return False
-    if source_type == "local" and not files:
+
+    if source_type == "Upload_Files" and not files:
         st.error("Please upload at least one file.")
+        logger.error("No files uploaded for 'Upload Files' source type")
         return False
-    if source_type == "web" and (not url or not url.strip()):
+    if source_type == "Fetch from Web" and (not url or not url.strip()):
         st.error("Please provide a valid URL.")
+        logger.error("No valid URL provided for 'Fetch from Web' source type")
         return False
 
+    persona_dir = os.path.join(PERSONAS_DIR, safe_name)
+    logger.debug(f"Persona directory: {persona_dir}")
+    
+    meta_source_type = "local" if source_type == "Upload_Files" else "web"
+    metadata = {
+        "name": name, 
+        "source_type": meta_source_type, 
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"), 
+        "sources": []
+    }
+    
+    if meta_source_type == "local" and files:
+        metadata["sources"] = [{"type": "file", "name": file.name} for file in files]
+    elif meta_source_type == "web" and url:
+        metadata["sources"] = [{"type": "url", "value": url}]
+    logger.debug(f"Metadata prepared: {metadata}")
+
+    st.toast(f"Creating persona '{name}'...")
+    
     try:
-        # Create persona folder and vectordb subfolder
-        persona_dir = os.path.join(PERSONAS_DIR, safe_name)
-        vector_dir = os.path.join(persona_dir, CHROMA_DIR)
-        os.makedirs(vector_dir, exist_ok=True)
-
-        # Prepare metadata
-        metadata = {
-            "name": name,
-            "source_type": source_type,
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "sources": []
-        }
-        if source_type == "local" and files:
-            metadata["sources"] = [{"type": "file", "name": file.name} for file in files]
-        elif source_type == "web" and url:
-            metadata["sources"] = [{"type": "url", "value": url}]
-
-        # Create metadata file
+        logger.debug(f"Creating directory: {os.path.join(persona_dir, CHROMA_DIR)}")
+        os.makedirs(os.path.join(persona_dir, CHROMA_DIR), exist_ok=True)
+        
+        logger.debug(f"Writing metadata to {os.path.join(persona_dir, 'info.json')}")
         with open(os.path.join(persona_dir, "info.json"), "w") as f:
             json.dump(metadata, f, indent=4)
-
-        st.toast(f"Creating persona '{name}'...")
-        with st.spinner(f"Setting up persona '{name}'..."):
-            time.sleep(1)  # Brief delay for UX, replace with pipeline processing later
-        st.success(f"Persona '{name}' created successfully!")
-        return True
+        
+        with st.spinner(f"Ingesting documents for '{name}'... This may take a while."):
+            logger.debug(f"Source type: {meta_source_type}")
+            if meta_source_type == "local":
+                logger.debug("Calling process_local_files...")
+                success = process_local_files(safe_name, files)
+                logger.debug(f"process_local_files returned: {success}")
+            # elif meta_source_type == "web":
+            #     success = process_web_url(safe_name, url)
+            else:
+                logger.error(f"Invalid source type: {meta_source_type}")
+                success = False
+        
+        if success:
+            st.success(f"Persona '{name}' created successfully!")
+            logger.info(f"Persona '{name}' created successfully")
+            return True
+        else:
+            logger.error(f"Failed to process documents for '{name}'")
+            if os.path.exists(persona_dir):
+                logger.debug(f"Cleaning up directory: {persona_dir}")
+                shutil.rmtree(persona_dir)
+            st.error(f"Failed to process documents for '{name}'. Directory cleaned up. Please check the error details above.")
+            return False
+            
     except Exception as e:
-        st.error(f"Failed to create persona: {str(e)}")
+        logger.error(f"Error creating persona '{name}': {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        if os.path.exists(persona_dir):
+            logger.debug(f"Cleaning up directory: {persona_dir}")
+            shutil.rmtree(persona_dir)
+        st.error(f"Error creating persona '{name}': {str(e)}")
+        st.error("Check the console or app.log for detailed error information.")
         return False
 
 def delete_persona_backend(name):
-    st.toast(f"Persona '{name}' has been removed.")
-    time.sleep(1)
+    # This will be expanded later to delete the actual folder
+    st.toast(f"Persona '{name}' has been removed (mock).")
 
 def get_ai_response_backend(persona, user_message, chat_history):
     return f"This is a mock response from **{persona}**. You said: '{user_message}'"
 
 # --- UI Screen Functions ---
+
+
 def show_main_page():
     shimmering_text_css()
     st.markdown('<h1 class="shimmer">Who do you want me to be?</h1>', unsafe_allow_html=True)
     st.info("Create a new persona below, or select an existing one from the sidebar to begin chatting.")
-
     st.header("Create a New Persona")
 
-    # Initialize checkbox states if form was reset
-    if st.session_state.form_reset:
-        upload_files = False
-        fetch_web = False
+    name = st.text_input("Persona Name", placeholder="e.g., My Mom, Albert Einstein")
+    source_type = st.radio("Select Data Source", ['Upload_Files', 'Fetch_from_Web'], horizontal=True)
+    
+    files = None
+    url = None
+    
+    if source_type == 'Upload_Files':
+        files = st.file_uploader(
+            "Upload documents (.pdf, .txt)", 
+            accept_multiple_files=True, 
+            type=['pdf', 'txt'],  # Explicitly specify accepted types
+            label_visibility="collapsed"
+        )
+        
+        # Show file preview
+        if files:
+            st.write("📁 **Selected Files:**")
+            for i, file in enumerate(files):
+                file_size = len(file.getvalue())
+                st.write(f"   {i+1}. {file.name} ({file.type}, {file_size:,} bytes)")
+                file.seek(0)  # Reset file pointer
     else:
-        upload_files = st.session_state.get('upload_files', False)
-        fetch_web = st.session_state.get('fetch_web', False)
+        url = st.text_input(
+            "Website URL", 
+            placeholder="e.g., https://www.gutenberg.org/ebooks/3600", 
+            label_visibility="collapsed"
+        )
+    
+    if st.button("Create Persona", type="primary"):
+        if create_new_persona_backend(name, source_type, files=files, url=url):
+            for key in ["persona_name", "persona_source_type", "persona_files", "persona_url"]:
+                st.session_state.pop(key, None)
 
-    # Handle checkbox logic to ensure only one is selected
-    def update_upload_files():
-        st.session_state.upload_files = True
-        st.session_state.fetch_web = False
-        st.session_state.url = ""
-        st.session_state.files = None
-
-    def update_fetch_web():
-        st.session_state.upload_files = False
-        st.session_state.fetch_web = True
-        st.session_state.files = None
-        st.session_state.url = ""
-
-    st.checkbox("Upload Files", value=upload_files, key="upload_files", on_change=update_upload_files)
-    st.checkbox("Fetch from Web", value=fetch_web, key="fetch_web", on_change=update_fetch_web)
-
-    # Show inputs based on checkbox state
-    if st.session_state.upload_files:
-        st.session_state.files = st.file_uploader("Upload documents (.pdf, .txt)", accept_multiple_files=True)
-    elif st.session_state.fetch_web:
-        st.session_state.url = st.text_input("Website URL", value=st.session_state.url, placeholder="e.g., https://www.gutenberg.org/ebooks/3600")
-    else:
-        st.session_state.files = None
-        st.session_state.url = ""
-        st.warning("Please select a data source.")
-
-    # Form for submission
-    with st.form(key="persona_form"):
-        name = st.text_input("Persona Name", placeholder="e.g., My Mom, Albert Einstein")
-        submitted = st.form_submit_button("Create Persona")
-        if submitted:
-            source_type = "local" if st.session_state.upload_files else "web" if st.session_state.fetch_web else None
-            if create_new_persona_backend(name, source_type, files=st.session_state.files, url=st.session_state.url):
-                # Signal form reset for next run
-                st.session_state.form_reset = True
-                st.session_state.files = None
-                st.session_state.url = ""
-                st.rerun()
+            # Go directly to chat with this persona
+            st.session_state.selected_persona = name
+            st.session_state.chat_history = []
+            st.rerun()
 
 def show_chat_screen():
     st.header(f"Conversing with: *{st.session_state.selected_persona}*")
-
+    # Chat history and input logic remains the same
     for message in st.session_state.chat_history:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-
     if prompt := st.chat_input("What would you like to ask?"):
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
-
         with st.chat_message("assistant"):
             with st.spinner("🧠 Thinking..."):
                 response = get_ai_response_backend(st.session_state.selected_persona, prompt, st.session_state.chat_history)
                 st.markdown(response)
-        
         st.session_state.chat_history.append({"role": "assistant", "content": response})
 
-# --- Confirmation Dialog for Deletion ---
 @st.dialog("Confirm Deletion")
 def confirm_delete(name):
     st.warning(f"Are you sure you want to delete the persona: **{name}**?")
-    col1, col2 = st.columns(2)
-    if col1.button("Yes, Delete", type="primary"):
+    if st.button("Yes, Delete", type="primary"):
         delete_persona_backend(name)
         st.rerun()
-    if col2.button("Cancel"):
+    if st.button("Cancel"):
         st.rerun()
 
-# --- Sidebar Navigation ---
+# --- Sidebar & Main Router ---
 with st.sidebar:
     st.title("Persona AI")
     st.header("Your Personas")
-
-    # If a persona is selected, show a button to go back to the main page
     if st.session_state.selected_persona:
         if st.button("🏠 Back to Main Page", use_container_width=True):
             st.session_state.selected_persona = None
             st.rerun()
-    
     st.divider()
-
-    # Display each persona with a select button and a delete button
     for name in get_personas():
         col1, col2 = st.columns([4, 1])
-        with col1:
-            if st.button(name, key=f"select_{name}", use_container_width=True):
-                st.session_state.selected_persona = name
-                st.session_state.chat_history = []
-                st.rerun()
-        with col2:
-            if st.button("❌", key=f"delete_{name}", use_container_width=True):
-                confirm_delete(name)
+        if col1.button(name, key=f"select_{name}", use_container_width=True):
+            st.session_state.selected_persona = name
+            st.session_state.chat_history = []
+            st.rerun()
+        if col2.button("❌", key=f"delete_{name}", use_container_width=True):
+            confirm_delete(name)
 
-# --- Main Page Router ---
 if st.session_state.selected_persona is None:
     show_main_page()
 else:
